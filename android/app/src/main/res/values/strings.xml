@@ -1,7 +1,7 @@
-<?xml version='1.0' encoding='utf-8'?>
+﻿<?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">WallSync</string>
-    <string name="title_activity_main">WallSync</string>
+    <string name="app_name">WallApp</string>
+    <string name="title_activity_main">WallApp</string>
     <string name="package_name">com.wallapp.app</string>
     <string name="custom_url_scheme">com.wallapp.app</string>
 </resources>

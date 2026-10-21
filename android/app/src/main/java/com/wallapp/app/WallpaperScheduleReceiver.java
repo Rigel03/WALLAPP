@@ -14,10 +14,11 @@ public class WallpaperScheduleReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         if (intent == null) return;
 
+        final Context app = context.getApplicationContext();
         String action = intent.getAction();
-        if (Intent.ACTION_BOOT_COMPLETED.equals(action)) {
-            Log.i(TAG, "Device rebooted; re-registering wallpaper schedules");
-            WallpaperHelper.rescheduleAllAlarms(context);
+        if (Intent.ACTION_BOOT_COMPLETED.equals(action) || Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
+            Log.i(TAG, "Re-registering wallpaper schedules after " + action);
+            WallpaperHelper.rescheduleAllAlarms(app);
             return;
         }
 
@@ -28,14 +29,10 @@ public class WallpaperScheduleReceiver extends BroadcastReceiver {
         Executors.newSingleThreadExecutor().execute(() -> {
             try {
                 if (wallpaperPath != null && !wallpaperPath.isEmpty()) {
-                    WallpaperHelper.applyWallpaperFromPath(
-                        context,
-                        wallpaperPath,
-                        target != null ? target : "BOTH"
-                    );
+                    WallpaperHelper.tryApplyWallpaper(app, wallpaperPath, target != null ? target : "BOTH");
                 }
-                // Re-arm alarms for the next 24-hour cycle
-                WallpaperHelper.rescheduleAllAlarms(context);
+                // Arm the next occurrence (tomorrow) for every schedule.
+                WallpaperHelper.rescheduleAllAlarms(app);
             } finally {
                 pendingResult.finish();
             }

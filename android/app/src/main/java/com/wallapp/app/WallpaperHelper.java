@@ -8,15 +8,16 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
 import android.os.Build;
+import android.util.DisplayMetrics;
 import android.util.Log;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
@@ -28,67 +29,134 @@ public class WallpaperHelper {
     public static final String KEY_SCHEDULES = "schedules_json";
     public static final String KEY_DEFAULT_TARGET = "default_target";
     public static final String KEY_CURRENT_INDEX = "current_index";
+    private static final int MAX_ALARMS = 50;
+    private static final int ALARM_REQUEST_BASE = 2000;
+
+    /** Absolute app-private folder that holds every wallpaper (and its thumbnail). */
+    public static File wallpaperDir(Context context) {
+        return new File(context.getFilesDir(), "wallpapers");
+    }
 
     /**
-     * Applies a wallpaper located inside Context.getFilesDir() (Capacitor Directory.Data).
+     * Decodes an image from app storage, centre-crops it to the screen and applies it.
+     * Throws with a human-readable message so the UI can show the real reason on failure.
      */
-    public static boolean applyWallpaperFromPath(Context context, String relativePath, String target) {
+    public static void applyWallpaper(Context context, String relativePath, String target) throws Exception {
+        File file = new File(context.getFilesDir(), relativePath);
+        if (!file.exists()) {
+            throw new IOException("Image file is missing: " + relativePath);
+        }
+
+        WallpaperManager wm = WallpaperManager.getInstance(context);
+        if (!wm.isWallpaperSupported()) {
+            throw new IOException("This device does not support wallpapers");
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !wm.isSetWallpaperAllowed()) {
+            throw new IOException("Changing wallpaper is blocked on this device");
+        }
+
+        DisplayMetrics dm = context.getResources().getDisplayMetrics();
+        int screenW = Math.max(1, dm.widthPixels);
+        int screenH = Math.max(1, dm.heightPixels);
+
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw new IOException("Image could not be read (corrupt file?)");
+        }
+
+        int sample = 1;
+        while ((bounds.outWidth / (sample * 2)) >= screenW && (bounds.outHeight / (sample * 2)) >= screenH) {
+            sample *= 2;
+        }
+
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sample;
+        opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        Bitmap source = BitmapFactory.decodeFile(file.getAbsolutePath(), opts);
+        if (source == null) {
+            throw new IOException("Image could not be decoded");
+        }
+
+        Bitmap cropped = centerCrop(source, screenW, screenH);
         try {
-            File file = new File(context.getFilesDir(), relativePath);
-            if (!file.exists()) {
-                Log.e(TAG, "Wallpaper file does not exist: " + file.getAbsolutePath());
-                return false;
-            }
-
-            WallpaperManager wallpaperManager = WallpaperManager.getInstance(context);
-            try (InputStream is = new FileInputStream(file)) {
-                Bitmap bitmap = BitmapFactory.decodeStream(is);
-                if (bitmap == null) {
-                    Log.e(TAG, "Failed to decode bitmap from: " + file.getAbsolutePath());
-                    return false;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                int flags = WallpaperManager.FLAG_SYSTEM | WallpaperManager.FLAG_LOCK;
+                if ("SYSTEM".equalsIgnoreCase(target)) {
+                    flags = WallpaperManager.FLAG_SYSTEM;
+                } else if ("LOCK".equalsIgnoreCase(target)) {
+                    flags = WallpaperManager.FLAG_LOCK;
                 }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    int flags = WallpaperManager.FLAG_SYSTEM | WallpaperManager.FLAG_LOCK;
-                    if ("SYSTEM".equalsIgnoreCase(target)) {
-                        flags = WallpaperManager.FLAG_SYSTEM;
-                    } else if ("LOCK".equalsIgnoreCase(target)) {
-                        flags = WallpaperManager.FLAG_LOCK;
-                    }
-                    wallpaperManager.setBitmap(bitmap, null, true, flags);
-                } else {
-                    wallpaperManager.setBitmap(bitmap);
-                }
+                wm.setBitmap(cropped, null, true, flags);
+            } else {
+                wm.setBitmap(cropped);
             }
+        } finally {
+            if (cropped != source) cropped.recycle();
+            source.recycle();
+        }
+
+        rememberIndex(context, relativePath);
+    }
+
+    /** Boolean wrapper for background callers (alarm receiver, tile). Logs the failure. */
+    public static boolean tryApplyWallpaper(Context context, String relativePath, String target) {
+        try {
+            applyWallpaper(context, relativePath, target);
             return true;
         } catch (Exception e) {
-            Log.e(TAG, "Error setting wallpaper", e);
+            Log.e(TAG, "Could not apply wallpaper " + relativePath, e);
             return false;
         }
     }
 
+    private static Bitmap centerCrop(Bitmap src, int targetW, int targetH) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        float scale = Math.max((float) targetW / w, (float) targetH / h);
+        int cropW = Math.min(w, Math.round(targetW / scale));
+        int cropH = Math.min(h, Math.round(targetH / scale));
+        int x = Math.max(0, (w - cropW) / 2);
+        int y = Math.max(0, (h - cropH) / 2);
+        Matrix m = new Matrix();
+        m.postScale(scale, scale);
+        return Bitmap.createBitmap(src, x, y, cropW, cropH, m, true);
+    }
+
+    private static void rememberIndex(Context context, String relativePath) {
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            JSONArray arr = new JSONArray(prefs.getString(KEY_WALLPAPERS, "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                if (relativePath.equals(arr.getString(i))) {
+                    prefs.edit().putInt(KEY_CURRENT_INDEX, i).apply();
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not store current index", e);
+        }
+    }
+
     /**
-     * Cycles to the next wallpaper stored in SharedPreferences.
-     * Used by both the Quick Settings Tile and the Capacitor JS bridge.
+     * Applies the next wallpaper in the saved list. Shared by the Quick Settings tile and the JS bridge.
+     * Returns the applied relative path, or null when the list is empty / every image failed.
      */
     public static String cycleToNextWallpaper(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String jsonStr = prefs.getString(KEY_WALLPAPERS, "[]");
         String defaultTarget = prefs.getString(KEY_DEFAULT_TARGET, "BOTH");
-        int currentIndex = prefs.getInt(KEY_CURRENT_INDEX, -1);
+        int current = prefs.getInt(KEY_CURRENT_INDEX, -1);
 
         try {
-            JSONArray arr = new JSONArray(jsonStr);
-            if (arr.length() == 0) {
-                return null;
-            }
-            int nextIndex = (currentIndex + 1) % arr.length();
-            String nextPath = arr.getString(nextIndex);
-
-            boolean ok = applyWallpaperFromPath(context, nextPath, defaultTarget);
-            if (ok) {
-                prefs.edit().putInt(KEY_CURRENT_INDEX, nextIndex).apply();
-                return nextPath;
+            JSONArray arr = new JSONArray(prefs.getString(KEY_WALLPAPERS, "[]"));
+            int count = arr.length();
+            for (int step = 1; step <= count; step++) {
+                int idx = ((current + step) % count + count) % count;
+                String path = arr.getString(idx);
+                if (tryApplyWallpaper(context, path, defaultTarget)) {
+                    return path;
+                }
             }
         } catch (Exception e) {
             Log.e(TAG, "Failed to cycle wallpaper", e);
@@ -96,90 +164,72 @@ public class WallpaperHelper {
         return null;
     }
 
-    /**
-     * Registers or updates daily time-based triggers using Android AlarmManager.
-     */
+    public static boolean canScheduleExact(Context context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true;
+        AlarmManager am = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        return am != null && am.canScheduleExactAlarms();
+    }
+
+    /** Re-arms one alarm per enabled schedule (next occurrence). Call after every change and after every fire. */
     public static void rescheduleAllAlarms(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String schedulesStr = prefs.getString(KEY_SCHEDULES, "[]");
-        AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
-        if (alarmManager == null) return;
+        AlarmManager am = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) return;
 
         try {
-            JSONArray arr = new JSONArray(schedulesStr);
-            // Cancel up to 50 previously indexed alarms first
-            for (int i = 0; i < 50; i++) {
-                Intent cancelIntent = new Intent(context, WallpaperScheduleReceiver.class);
-                PendingIntent pi = PendingIntent.getBroadcast(
-                    context,
-                    2000 + i,
-                    cancelIntent,
-                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-                );
-                alarmManager.cancel(pi);
+            for (int i = 0; i < MAX_ALARMS; i++) {
+                am.cancel(buildPendingIntent(context, i, new Intent(context, WallpaperScheduleReceiver.class)));
             }
 
-            List<JSONObject> enabledList = new ArrayList<>();
+            JSONArray arr = new JSONArray(prefs.getString(KEY_SCHEDULES, "[]"));
+            List<JSONObject> enabled = new ArrayList<>();
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject obj = arr.getJSONObject(i);
-                if (obj.optBoolean("enabled", true)) {
-                    enabledList.add(obj);
-                }
+                if (obj.optBoolean("enabled", true)) enabled.add(obj);
             }
 
-            for (int i = 0; i < enabledList.size() && i < 50; i++) {
-                JSONObject item = enabledList.get(i);
-                String timeStr = item.optString("time", "08:00");
+            boolean exact = canScheduleExact(context);
+            for (int i = 0; i < enabled.size() && i < MAX_ALARMS; i++) {
+                JSONObject item = enabled.get(i);
                 String wallpaperPath = item.optString("wallpaperPath", "");
-                String target = item.optString("target", "BOTH");
-
-                String[] parts = timeStr.split(":");
+                String[] parts = item.optString("time", "08:00").split(":");
                 if (parts.length != 2 || wallpaperPath.isEmpty()) continue;
 
-                int hour = Integer.parseInt(parts[0]);
-                int minute = Integer.parseInt(parts[1]);
-
-                Calendar calendar = Calendar.getInstance();
-                calendar.set(Calendar.HOUR_OF_DAY, hour);
-                calendar.set(Calendar.MINUTE, minute);
-                calendar.set(Calendar.SECOND, 0);
-                calendar.set(Calendar.MILLISECOND, 0);
-
-                // If the time has already passed today, schedule for tomorrow
-                if (calendar.getTimeInMillis() <= System.currentTimeMillis()) {
-                    calendar.add(Calendar.DAY_OF_YEAR, 1);
+                Calendar cal = Calendar.getInstance();
+                cal.set(Calendar.HOUR_OF_DAY, Integer.parseInt(parts[0]));
+                cal.set(Calendar.MINUTE, Integer.parseInt(parts[1]));
+                cal.set(Calendar.SECOND, 0);
+                cal.set(Calendar.MILLISECOND, 0);
+                if (cal.getTimeInMillis() <= System.currentTimeMillis()) {
+                    cal.add(Calendar.DAY_OF_YEAR, 1);
                 }
 
                 Intent intent = new Intent(context, WallpaperScheduleReceiver.class);
                 intent.putExtra("wallpaperPath", wallpaperPath);
-                intent.putExtra("target", target);
-                intent.putExtra("alarmIndex", i);
-                intent.putExtra("hour", hour);
-                intent.putExtra("minute", minute);
+                intent.putExtra("target", item.optString("target", "BOTH"));
+                PendingIntent pi = buildPendingIntent(context, i, intent);
 
-                PendingIntent pendingIntent = PendingIntent.getBroadcast(
-                    context,
-                    2000 + i,
-                    intent,
-                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-                );
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    alarmManager.setAndAllowWhileIdle(
-                        AlarmManager.RTC_WAKEUP,
-                        calendar.getTimeInMillis(),
-                        pendingIntent
-                    );
-                } else {
-                    alarmManager.set(
-                        AlarmManager.RTC_WAKEUP,
-                        calendar.getTimeInMillis(),
-                        pendingIntent
-                    );
+                try {
+                    if (exact) {
+                        am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), pi);
+                    } else {
+                        am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), pi);
+                    }
+                } catch (SecurityException se) {
+                    am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), pi);
                 }
             }
         } catch (Exception e) {
             Log.e(TAG, "Error scheduling wallpaper alarms", e);
         }
+    }
+
+    private static PendingIntent buildPendingIntent(Context context, int index, Intent intent) {
+        return PendingIntent.getBroadcast(
+            context,
+            ALARM_REQUEST_BASE + index,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
     }
 }

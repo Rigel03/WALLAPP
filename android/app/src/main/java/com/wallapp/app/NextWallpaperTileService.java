@@ -1,5 +1,6 @@
 package com.wallapp.app;
 
+import android.graphics.drawable.Icon;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,8 +20,9 @@ public class NextWallpaperTileService extends TileService {
         super.onStartListening();
         Tile tile = getQsTile();
         if (tile != null) {
-            tile.setState(Tile.STATE_ACTIVE);
+            tile.setIcon(Icon.createWithResource(this, R.drawable.ic_tile));
             tile.setLabel("Next Wallpaper");
+            tile.setState(Tile.STATE_INACTIVE);
             tile.updateTile();
         }
     }
@@ -28,36 +30,16 @@ public class NextWallpaperTileService extends TileService {
     @Override
     public void onClick() {
         super.onClick();
-        Tile tile = getQsTile();
-        if (tile != null) {
-            tile.setState(Tile.STATE_UNAVAILABLE);
-            tile.updateTile();
-        }
+        final android.content.Context app = getApplicationContext();
 
         Executors.newSingleThreadExecutor().execute(() -> {
-            String nextPath = WallpaperHelper.cycleToNextWallpaper(getApplicationContext());
+            String nextPath = WallpaperHelper.cycleToNextWallpaper(app);
 
-            new Handler(Looper.getMainLooper()).post(() -> {
-                Tile updatedTile = getQsTile();
-                if (updatedTile != null) {
-                    updatedTile.setState(Tile.STATE_ACTIVE);
-                    updatedTile.updateTile();
-                }
-
-                if (nextPath != null) {
-                    Toast.makeText(
-                        getApplicationContext(),
-                        "Wallpaper cycled!",
-                        Toast.LENGTH_SHORT
-                    ).show();
-                } else {
-                    Toast.makeText(
-                        getApplicationContext(),
-                        "Add wallpapers in WallSync first",
-                        Toast.LENGTH_SHORT
-                    ).show();
-                }
-            });
+            new Handler(Looper.getMainLooper()).post(() -> Toast.makeText(
+                app,
+                nextPath != null ? "Wallpaper changed" : "Add wallpapers in WallApp first",
+                Toast.LENGTH_SHORT
+            ).show());
         });
     }
 }
